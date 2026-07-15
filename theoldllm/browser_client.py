@@ -51,9 +51,19 @@ class PlaywrightTheOldLLM:
 
         from playwright.async_api import async_playwright
 
+        if self.storage_path:
+            os.makedirs(os.path.dirname(self.storage_path), exist_ok=True)
+
         p = await async_playwright().start()
         launch_args = {
             "headless": self.headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+            ],
         }
         if self.proxy:
             launch_args["proxy"] = self.proxy
