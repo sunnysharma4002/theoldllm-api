@@ -156,15 +156,21 @@ class DirectTheOldLLM:
                 raise RateLimitError(body, status_code=resp.status_code, body=body)
             raise APIError(body, status_code=resp.status_code, body=body)
 
-        for line in resp.iter_lines():
-            line = line.strip()
-            if not line:
+        buffer = ""
+        for raw_chunk in resp.iter_content(chunk_size=None):
+            if raw_chunk is None:
                 continue
-            chunk = parse_sse_line(line)
-            if chunk is not None:
-                yield chunk
-                if chunk.is_done:
-                    return
+            buffer += raw_chunk.decode("utf-8", errors="replace")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                chunk = parse_sse_line(line)
+                if chunk is not None:
+                    yield chunk
+                    if chunk.is_done:
+                        return
 
     def chat(
         self,
