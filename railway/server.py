@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Railway server - TheOldLLM OpenAI-compatible proxy."""
+"""Railway server - TheOldLLM OpenAI-compatible proxy using curl_cffi."""
 
 import asyncio
 import json
 import logging
 import os
 import sys
-import traceback
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from aiohttp import web
-from theoldllm.browser_client import PlaywrightTheOldLLM
+from theoldllm.direct_client import DirectTheOldLLM
 from theoldllm.models import Models
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -19,38 +19,14 @@ logger = logging.getLogger("railway-server")
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 8080))
-STORAGE_PATH = os.environ.get("STORAGE_PATH", "/app/data/session.json")
 
-client = None
-ready = False
-
-
-async def get_client():
-    global client, ready
-    if client is None:
-        client = PlaywrightTheOldLLM(
-            base_url="https://theoldllm.vercel.app",
-            headless=False,  # xvfb provides virtual display
-            storage_path=STORAGE_PATH,
-        )
-    if not ready:
-        logger.info("Starting Playwright browser...")
-        try:
-            await client._ensure_session()
-            ready = True
-            logger.info("Browser session established")
-        except Exception as e:
-            logger.error(f"Browser session failed: {e}")
-            logger.error(traceback.format_exc())
-            raise
-    return client
+client = DirectTheOldLLM()
+ready = True  # No warmup needed - curl_cffi connects on first request
 
 
 async def chat_completions(request):
     try:
-        cli = await get_client()
         body = await request.json()
-
         model_id = body.get("model", "gpt-5-mini-aichat")
         messages = body.get("messages", [])
         stream = body.get("stream", False)
@@ -71,21 +47,28 @@ async def chat_completions(request):
                 },
             )
             await resp.prepare(request)
-            async for chunk in cli.chat_stream(model=model_id, messages=messages, max_tokens=max_tokens, temperature=temperature, top_p=top_p):
+            for chunk in client.chat_stream(
+                model=model_id, messages=messages,
+                max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+            ):
                 await resp.write(_sse_chunk(chunk, model_id).encode())
                 if chunk.is_done:
                     await resp.write(_sse_done(model_id).encode())
                     break
+            await resp.write(b"data: [DONE]\n\n")
             return resp
         else:
             content = ""
-            async for chunk in cli.chat_stream(model=model_id, messages=messages, max_tokens=max_tokens, temperature=temperature, top_p=top_p):
+            for chunk in client.chat_stream(
+                model=model_id, messages=messages,
+                max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+            ):
                 if chunk.content:
                     content += chunk.content
             return web.json_response({
                 "id": "chatcmpl-theoldllm",
                 "object": "chat.completion",
-                "created": _now(),
+                "created": int(time.time()),
                 "model": model_id,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
             }, headers={"Access-Control-Allow-Origin": "*"})
@@ -106,20 +89,19 @@ async def list_models(request):
 
 
 async def health(request):
-    return web.json_response({"status": "ok" if ready else "starting", "model_count": len(Models.ALL)}, headers={"Access-Control-Allow-Origin": "*"})
+    return web.json_response({"status": "ok", "model_count": len(Models.ALL)}, headers={"Access-Control-Allow-Origin": "*"})
 
 
 async def cors(request):
-    return web.Response(headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization"})
-
-
-def _now():
-    import time
-    return int(time.time())
+    return web.Response(headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    })
 
 
 def _sse_chunk(chunk, model_id):
-    d = {"id": "chatcmpl-theoldllm", "object": "chat.completion.chunk", "created": _now(), "model": model_id, "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
+    d = {"id": "chatcmpl-theoldllm", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
     delta = {}
     if chunk.content:
         delta["content"] = chunk.content
@@ -132,12 +114,11 @@ def _sse_chunk(chunk, model_id):
 
 
 def _sse_done(model_id):
-    return f"data: {json.dumps({'id': 'chatcmpl-theoldllm', 'object': 'chat.completion.chunk', 'created': _now(), 'model': model_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+    return f"data: {json.dumps({'id': 'chatcmpl-theoldllm', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
 
 
 async def main():
     app = web.Application()
-    app.on_startup.append(lambda _: asyncio.create_task(_warmup()))
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_get("/v1/models", list_models)
     app.router.add_get("/health", health)
@@ -154,15 +135,6 @@ async def main():
     logger.info(f"Models: {len(Models.ALL)}")
 
     await asyncio.Event().wait()
-
-
-async def _warmup():
-    logger.info("Warming up browser session...")
-    try:
-        await get_client()
-    except Exception as e:
-        logger.warning(f"Warmup failed: {e}")
-        logger.warning("Will retry on first request")
 
 
 if __name__ == "__main__":

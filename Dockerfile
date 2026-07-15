@@ -2,38 +2,19 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install shared libs for Chromium + xvfb for virtual display
-RUN apt-get update && apt-get install -y \
-    libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 \
-    libcups2t64 libdrm2 libdbus-1-3 libxkbcommon0 \
-    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
-    libgbm1 libpango-1.0-0 libcairo2 libasound2t64 \
-    libatspi2.0-0t64 libwayland-client0 libwayland-cursor0 \
-    libwayland-egl1 libxshmfence1 libglib2.0-0t64 \
-    xvfb x11-utils \
-    && rm -rf /var/lib/apt/lists/*
-
 # Copy package
 COPY theoldllm/ /app/theoldllm/
 COPY setup.py /app/
 COPY README.md /app/
 COPY railway/server.py /app/server.py
 
-# Install deps
+# Install deps (no Chromium/Playwright needed)
 RUN pip install --no-cache-dir -e . && \
-    pip install --no-cache-dir aiohttp playwright
-
-# Install Chromium via Playwright
-ENV PLAYWRIGHT_BROWSERS_PATH=/app/ms-browsers
-RUN python -m playwright install chromium
-
-# Session storage
-RUN mkdir -p /app/data
+    pip install --no-cache-dir aiohttp curl_cffi
 
 ENV HOST=0.0.0.0
 ENV PORT=8080
-ENV STORAGE_PATH=/app/data/session.json
 
 EXPOSE 8080
 
-CMD ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1280x720x24", "python", "/app/server.py"]
+CMD ["python", "/app/server.py"]
