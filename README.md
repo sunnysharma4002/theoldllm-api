@@ -168,9 +168,28 @@ docker run -p 8080:8080 theoldllm
 ```
 
 On Railway, point the service at this repo; `railway.json` selects the
-`Dockerfile`. This is best-effort: Cloudflare may serve an interactive challenge
-to a datacenter IP, and nothing can solve that unattended. Run it on a machine
-where a real window is acceptable if you need reliability.
+`Dockerfile`. Two settings matter:
+
+* **Memory ≥ 1 GB.** Chromium plus Xvfb does not fit in 512 MB; the container
+  will OOM-loop.
+* **`THEOLDLLM_STORAGE`** (default `/app/data/session.json`) keeps cookies, so
+  `cf_clearance` survives a restart if you attach a volume to `/app/data`.
+
+The server opens the HTTP port *before* launching the browser, and a browser
+failure no longer kills the process (Railway would just restart it and hide the
+reason). Ask it directly:
+
+```bash
+curl https://<app>.up.railway.app/health          # container up?
+curl https://<app>.up.railway.app/health?deep=1   # can it actually complete a chat?
+```
+
+`deep` runs one real `gpt-6-luna` completion and returns `{"ok":true,"reply":"ok"}`
+or the exact upstream reason, e.g. `{"ok":false,"code":"turnstile_unavailable"}`.
+
+This is best-effort: Cloudflare may serve an interactive challenge to a
+datacenter IP, and nothing can solve that unattended. Run it on a machine where
+a real window is acceptable if you need reliability.
 
 ## Console client
 
@@ -185,7 +204,7 @@ await oldllm.raw(oldllm.buildPayload([{ role: "user", content: "hi" }]))
 
 ## Verification
 
-* Offline: `pytest` — 54 tests over SSE decoding, payload building, model
+* Offline: `pytest` — 57 tests over SSE decoding, payload building, model
   resolution, retry/error mapping, and the OpenAI facade. No network, no browser.
 * Live, in a page on the site: the exact JS shipped in
   `theoldllm/browser.py` (`_MINT_TOKEN_JS` + `_REQUEST_JS`) minted a token and

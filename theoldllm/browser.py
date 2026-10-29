@@ -405,6 +405,7 @@ class AsyncTheOldLLM:
 
         await self.start()
         last_error: Optional[Exception] = None
+        bot_failures = 0
         async with self._lock("_request_lock"):
             for attempt in range(1, attempts + 1):
                 try:
@@ -428,14 +429,33 @@ class AsyncTheOldLLM:
                 status = int(result.get("status") or 0)
                 text = str(result.get("text") or "")
                 if attempt < attempts and status == 200 and '"BOT_CHECK_FAILED"' in text:
-                    LOG.debug("bot check rejected attempt %d, retrying", attempt)
-                    await asyncio.sleep(1.5)
+                    bot_failures += 1
+                    LOG.debug("bot check rejected attempt %d", attempt)
+                    if bot_failures >= 2:
+                        # The page's human-check runtime has gone stale (long
+                        # running server); a reload rebuilds it.
+                        await self._reload()
+                    else:
+                        await asyncio.sleep(1.5)
                     continue
                 return {"status": status, "text": text, "attempts": attempt}
 
             raise BrowserError(
                 f"the page call kept losing its execution context: {last_error}"
             )
+
+    async def _reload(self) -> None:
+        """Reload the page after repeated bot-check rejections."""
+        if self._page is None:
+            return
+        LOG.info("reloading the page to rebuild the human-check runtime")
+        try:
+            await self._page.reload(wait_until="domcontentloaded", timeout=self.load_timeout * 1000)
+        except Exception as exc:  # pragma: no cover - depends on the page
+            LOG.debug("reload failed: %s", exc)
+            return
+        await self._settle()
+        await self._save_state()
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:

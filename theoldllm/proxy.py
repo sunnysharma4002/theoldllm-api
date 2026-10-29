@@ -85,6 +85,7 @@ class OpenAICompatProxy:
         self._runner: Any = None
         self._site: Any = None
         self._client_lock: Optional[asyncio.Lock] = None
+        self._browser_error: Optional[str] = None
 
     # ----------------------------------------------------------------- client
 
@@ -97,7 +98,12 @@ class OpenAICompatProxy:
                 # launch their own browser.
                 if self._client is None:
                     client = AsyncTheOldLLM(**self._client_options)
-                    await client.start()
+                    try:
+                        await client.start()
+                    except Exception as error:
+                        self._browser_error = f"{type(error).__name__}: {error}"
+                        raise
+                    self._browser_error = None
                     self._client = client
         return self._client
 
@@ -260,14 +266,41 @@ class OpenAICompatProxy:
         from aiohttp import web
 
         page = self._client.page if self._client else None
-        return web.json_response(
-            {
-                "status": "ok" if page is not None else "starting",
-                "browser": bool(page),
-                "models": len(Models.picker()),
-                "upstream": BASE_URL,
-            }
-        )
+        body: dict[str, Any] = {
+            "status": "ok" if page is not None else ("error" if self._browser_error else "starting"),
+            "browser": bool(page),
+            "models": len(Models.picker()),
+            "upstream": BASE_URL,
+        }
+        if self._browser_error:
+            body["browser_error"] = self._browser_error
+
+        # /health?deep=1 runs a real completion, which is the only reliable way
+        # to tell "container is up" from "Cloudflare will not let us talk".
+        if request.query.get("deep") in {"1", "true", "yes"}:
+            if self._client is None:
+                try:
+                    await self.client()
+                except Exception as error:  # noqa: BLE001 - reported in the body
+                    body["deep"] = {"ok": False, "error": str(error), "code": "browser_unavailable"}
+                    return web.json_response(body, status=503)
+            try:
+                reply = await asyncio.wait_for(
+                    self._client.chat(
+                        DEFAULT_MODEL,
+                        [{"role": "user", "content": "Reply with exactly: ok"}],
+                        max_tokens=16,
+                    ),
+                    timeout=float(request.query.get("timeout", "90")),
+                )
+                body["deep"] = {"ok": True, "model": DEFAULT_MODEL, "reply": reply}
+            except asyncio.TimeoutError:
+                body["status"] = "error"
+                body["deep"] = {"ok": False, "code": "timeout", "error": "completion timed out"}
+            except Exception as error:  # noqa: BLE001 - reported in the body
+                body["status"] = "error"
+                body["deep"] = {"ok": False, "code": _status_for(error)[1], "error": str(error)}
+        return web.json_response(body)
 
     # -------------------------------------------------------------- lifecycle
 
@@ -314,7 +347,13 @@ class OpenAICompatProxy:
     async def serve_forever(self) -> None:
         await self.start()
         try:
-            await self.client()  # fail fast if the browser cannot start
+            try:
+                await self.client()  # warm the browser up
+            except Exception as error:  # noqa: BLE001 - keep serving so /health can explain
+                # Crashing here would put the container in a restart loop, which
+                # hides the real reason. Stay up and report it instead.
+                LOG.error("browser failed to start: %s", error)
+                LOG.error("the facade is still listening; check /health?deep=1")
             await asyncio.Event().wait()
         finally:
             await self.stop()
