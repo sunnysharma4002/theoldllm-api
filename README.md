@@ -187,24 +187,44 @@ curl https://<app>.up.railway.app/health?deep=1   # can it actually complete a c
 `deep` runs one real `gpt-6-luna` completion and returns `{"ok":true,"reply":"ok"}`
 or the exact upstream reason, e.g. `{"ok":false,"code":"turnstile_unavailable"}`.
 It also returns a `page` fingerprint (`userAgent`, `webdriver`, `brands`,
-`challengeFrames`) so a failure can be attributed:
-
-| `page.webdriver` | `page.brands` | Meaning | Lever |
-|---|---|---|---|
-| `true` | empty | the browser is being detected as automation | `THEOLDLLM_CHANNEL=chrome` (default in the image) |
-| `false` | populated | clean browser, still challenged | the **IP**: set `THEOLDLLM_PROXY` to a residential/mobile proxy |
-| `false` | populated | clean browser, no challenge frame | the page loaded wrong; check `page.title` |
+`challengeFrames`) so a failure can be attributed.
 
 `THEOLDLLM_PROXY` accepts a URL (`http://host:port`) or JSON for authenticated
 proxies (`{"server": "http://host:port", "username": "...", "password": "..."}`).
 
-The image already installs Google Chrome and sets `THEOLDLLM_CHANNEL=chrome`,
-because Playwright's bundled Chromium is challenged far more often. If a channel
-fails to launch, the client logs a warning and falls back to bundled Chromium.
+The image installs Google Chrome and sets `THEOLDLLM_CHANNEL=chrome`, because
+Playwright's bundled Chromium is challenged far more often. If a channel fails to
+launch, the client logs a warning and falls back to bundled Chromium.
 
-This is best-effort: Cloudflare may serve an interactive challenge to a
-datacenter IP, and nothing can solve that unattended. Run it on a machine where
-a real window is acceptable if you need reliability.
+### Turnstile under automation (verified 2026-10-29)
+
+Minting a token from a Playwright-launched browser does not work, and the usual
+advice does not fix it. Measured on the same machine, same network, minutes
+apart — the site in a normal browser mints a token in about a second, while:
+
+| Session | `navigator.webdriver` | Result |
+|---|---|---|
+| Playwright, fresh context, bundled Chromium | `false` | `600010` |
+| Playwright, fresh context, real Chrome 156 | `false` | `600010` |
+| Playwright, persistent profile, real Chrome | `false` / `true` | `600010` |
+| Playwright, headed, Xvfb, datacenter IP | `false` | timeout, then `600010` |
+| Patchright (stealth fork) | `false` | `window.turnstile` never defined — its transport is blocked by the site's `connect-src` CSP |
+| A normal browser, same IP | `false` | **token in ~1 s** |
+
+Diagnosis: Turnstile's client runs, completes its whole challenge round-trip to
+`challenges.cloudflare.com` (including `hagen`), and then rejects the session with
+`600010`, "generic challenge failure — bot behavior detected". Codes that *would*
+implicate the network or the key (`200500` iframe load, `1101xx`/`110200` key or
+domain, `1106xx` timeout) do not appear. The distinguishing variable is how the
+browser is driven, so the fingerprint knobs above are not the lever: a headed
+window, a real Chrome build, a clean UA, a persistent profile and a residential
+IP were each tried and none changed the outcome.
+
+The honest conclusion is that this transport is blocked by design: Turnstile is
+being asked to distinguish a person from automation, and the automation loses.
+Getting a token anyway means defeating that check, which this project does not
+do. Use it where a person is actually at the keyboard (the console client below),
+or use an API that does not gate on Turnstile.
 
 ## Console client
 

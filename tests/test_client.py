@@ -153,7 +153,20 @@ def test_turnstile_timeout_surfaces_as_a_turnstile_error():
     with pytest.raises(TurnstileError) as info:
         run(client.chat("gpt-6-luna", [{"role": "user", "content": "hi"}]))
     assert info.value.timed_out
-    assert "headless=False" in str(info.value)
+    assert "deep=1" in str(info.value)  # points at the diagnostic, not a guess
+    assert page.sent == []
+
+
+def test_a_600010_rejection_is_reported_as_detection_not_networking():
+    page = FakePage([OK_BODY], mint_error="turnstile error-callback: 600010")
+    client = make_client(page)
+
+    with pytest.raises(TurnstileError) as info:
+        run(client.chat("gpt-6-luna", [{"role": "user", "content": "hi"}]))
+    message = str(info.value)
+    assert "600010" in message
+    assert "automation" in message
+    assert not info.value.timed_out  # a rejection is not a timeout
     assert page.sent == []
 
 

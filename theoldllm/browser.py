@@ -163,15 +163,14 @@ class AsyncTheOldLLM:
 
     Args:
         base_url: site root.
-        headless: keep ``False``. In headless Chromium the Turnstile callback
-            never fires, so token minting times out; a headed window solves it in
-            about a second. Set it only if you have verified headless works for
-            you.
+        headless: keep ``False``. Headless Chromium cannot mint a token at all, but
+            heads-up does not make it work either: Turnstile answers ``600010``
+            ("bot detected") to any Playwright-driven browser. See the README.
         storage_path: JSON file for cookies/localStorage between runs.
         proxy: Playwright ``proxy=`` dict, e.g. ``{"server": "http://...:8080"}``.
-        channel: Playwright browser channel, typically ``"chrome"``. Real Chrome
-            is far less likely to be challenged than the bundled Chromium build;
-            it falls back to the bundled one if the channel is unavailable.
+        channel: Playwright browser channel, typically ``"chrome"``. It falls back
+            to the bundled Chromium build if the channel is unavailable. Note that
+            this did *not* change the Turnstile verdict in testing.
         user_agent: overrides the browser's own UA. Leave it ``None`` — a forced
             UA that disagrees with the actual browser is a fingerprinting signal.
         transport: testing hook — anything with an async ``request(payload)``
@@ -405,9 +404,22 @@ class AsyncTheOldLLM:
             )
         except Exception as exc:
             text = str(exc)
+            if "600010" in text:
+                hint = (
+                    "Turnstile rejected this browser as automation (600010). That is "
+                    "not a network, key or headless problem: a real browser on the "
+                    "same machine mints a token in about a second. See the README "
+                    "section 'Turnstile under automation'."
+                )
+            elif "timeout" in text.lower():
+                hint = (
+                    "The widget never answered. Check /health?deep=1 for the page "
+                    "fingerprint and the README for what each code means."
+                )
+            else:
+                hint = "See the README section 'Turnstile under automation'."
             raise TurnstileError(
-                f"could not mint a Turnstile token: {text}. "
-                "Run with headless=False; a headed window solves it immediately.",
+                f"could not mint a Turnstile token: {text}. {hint}",
                 timed_out="timeout" in text.lower(),
             ) from exc
         if not token or not isinstance(token, str):
