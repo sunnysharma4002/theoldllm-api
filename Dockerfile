@@ -1,20 +1,26 @@
+# Playwright needs a real display: Cloudflare Turnstile does not solve in
+# headless Chromium, so the facade runs inside Xvfb.
 FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /app
 
-# Copy package
-COPY theoldllm/ /app/theoldllm/
-COPY setup.py /app/
-COPY README.md /app/
-COPY railway/server.py /app/server.py
+COPY pyproject.toml README.md ./
+COPY theoldllm ./theoldllm
 
-# Install deps (no Chromium/Playwright needed)
-RUN pip install --no-cache-dir -e . && \
-    pip install --no-cache-dir aiohttp curl_cffi
+RUN pip install ".[proxy]" \
+    && python -m playwright install --with-deps chromium \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends xvfb \
+    && rm -rf /var/lib/apt/lists/*
 
-ENV HOST=0.0.0.0
 ENV PORT=8080
-
 EXPOSE 8080
 
-CMD ["python", "/app/server.py"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s \
+    CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8080')+'/health').read()"
+
+CMD xvfb-run -a python -m theoldllm serve --host 0.0.0.0 --port "${PORT:-8080}"
