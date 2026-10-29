@@ -37,6 +37,23 @@ LOG = logging.getLogger("theoldllm.proxy")
 
 DEFAULT_MODEL = "gpt-6-luna"
 
+_FINGERPRINT_JS = r"""
+() => ({
+  title: document.title,
+  readyState: document.readyState,
+  userAgent: navigator.userAgent,
+  webdriver: navigator.webdriver,
+  brands: navigator.userAgentData
+    ? navigator.userAgentData.brands.map((b) => b.brand + " " + b.version)
+    : null,
+  languages: navigator.languages,
+  turnstile: typeof window.turnstile,
+  challengeFrames: document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]').length,
+  turnstileInputs: document.querySelectorAll('input[name="cf-turnstile-response"]').length,
+  viewport: [window.innerWidth, window.innerHeight],
+})
+"""
+
 
 def _completion_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -278,6 +295,7 @@ class OpenAICompatProxy:
         # /health?deep=1 runs a real completion, which is the only reliable way
         # to tell "container is up" from "Cloudflare will not let us talk".
         if request.query.get("deep") in {"1", "true", "yes"}:
+            body["page"] = await self._page_fingerprint()
             if self._client is None:
                 try:
                     await self.client()
@@ -301,6 +319,20 @@ class OpenAICompatProxy:
                 body["status"] = "error"
                 body["deep"] = {"ok": False, "code": _status_for(error)[1], "error": str(error)}
         return web.json_response(body)
+
+    async def _page_fingerprint(self) -> dict[str, Any]:
+        """What the container's browser looks like from the page.
+
+        ``webdriver: true`` or an empty ``brands`` list means the browser is the
+        problem; a clean fingerprint plus a Turnstile timeout means the IP is.
+        """
+        if self._client is None or self._client.page is None:
+            return {"available": False}
+        try:
+            data = await self._client.page.evaluate(_FINGERPRINT_JS)
+            return {"available": True, **data}
+        except Exception as error:  # noqa: BLE001 - diagnostic only
+            return {"available": False, "error": str(error)}
 
     # -------------------------------------------------------------- lifecycle
 

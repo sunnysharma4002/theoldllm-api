@@ -44,11 +44,6 @@ CHAT_PATH = "/api/aichat"
 LEGACY_CHAT_PATH = "/api/chatgpt"
 TURNSTILE_SITEKEY = "0x4AAAAAADvYUN7pfr-aCtEA"
 
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-)
-
 LOG = logging.getLogger("theoldllm")
 
 _MINT_TOKEN_JS = r"""
@@ -174,6 +169,11 @@ class AsyncTheOldLLM:
             you.
         storage_path: JSON file for cookies/localStorage between runs.
         proxy: Playwright ``proxy=`` dict, e.g. ``{"server": "http://...:8080"}``.
+        channel: Playwright browser channel, typically ``"chrome"``. Real Chrome
+            is far less likely to be challenged than the bundled Chromium build;
+            it falls back to the bundled one if the channel is unavailable.
+        user_agent: overrides the browser's own UA. Leave it ``None`` — a forced
+            UA that disagrees with the actual browser is a fingerprinting signal.
         transport: testing hook — anything with an async ``request(payload)``
             returning ``{"status": int, "text": str}``. When set, no browser is
             launched.
@@ -187,7 +187,8 @@ class AsyncTheOldLLM:
         headless: bool = False,
         storage_path: Optional[str] = None,
         proxy: Optional[dict] = None,
-        user_agent: str = DEFAULT_USER_AGENT,
+        channel: Optional[str] = None,
+        user_agent: Optional[str] = None,
         path: str = CHAT_PATH,
         settle_delay: float = 1.0,
         request_timeout: float = 240.0,
@@ -199,6 +200,7 @@ class AsyncTheOldLLM:
         self.headless = headless
         self.storage_path = storage_path
         self.proxy = proxy
+        self.channel = channel
         self.user_agent = user_agent
         self.path = path
         self.settle_delay = settle_delay
@@ -263,21 +265,24 @@ class AsyncTheOldLLM:
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                # Cosmetic only: keeps navigator.webdriver falsy. It does not
-                # make Turnstile pass; a headed context does.
+                # Keeps navigator.webdriver falsy. Not sufficient on its own.
                 "--disable-blink-features=AutomationControlled",
             ],
+            # Playwright adds --enable-automation by default; it is one of the
+            # cheapest bot signals to read, so drop it.
+            "ignore_default_args": ["--enable-automation"],
         }
         if self.proxy:
             launch["proxy"] = self.proxy
 
         try:
-            self._browser = await self._playwright.chromium.launch(**launch)
+            self._browser = await self._launch_browser(launch)
             context_args: dict[str, Any] = {
                 "locale": "en-US",
                 "viewport": {"width": 1280, "height": 800},
-                "user_agent": self.user_agent,
             }
+            if self.user_agent:
+                context_args["user_agent"] = self.user_agent
             if self.storage_path and os.path.exists(self.storage_path):
                 context_args["storage_state"] = self.storage_path
             self._context = await self._browser.new_context(**context_args)
@@ -292,6 +297,21 @@ class AsyncTheOldLLM:
         except Exception as exc:
             await self.aclose()
             raise BrowserError(f"could not prepare the browser: {exc}") from exc
+
+    async def _launch_browser(self, launch: dict[str, Any]) -> Any:
+        """Launch the configured channel, falling back to bundled Chromium."""
+        if self.channel:
+            try:
+                browser = await self._playwright.chromium.launch(channel=self.channel, **launch)
+                LOG.info("launched channel=%s", self.channel)
+                return browser
+            except Exception as exc:
+                LOG.warning(
+                    "channel=%s unavailable (%s); falling back to bundled chromium",
+                    self.channel,
+                    exc,
+                )
+        return await self._playwright.chromium.launch(**launch)
 
     async def aclose(self) -> None:
         self._closed = True
@@ -550,7 +570,6 @@ __all__ = [
     "AsyncTheOldLLM",
     "BASE_URL",
     "CHAT_PATH",
-    "DEFAULT_USER_AGENT",
     "LEGACY_CHAT_PATH",
     "PageTransport",
     "TURNSTILE_SITEKEY",

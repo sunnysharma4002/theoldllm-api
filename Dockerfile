@@ -11,12 +11,18 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY theoldllm ./theoldllm
 
-# xvfb-run needs xauth, which Playwright's own deps do not pull in.
+# xvfb-run needs xauth; real Chrome is much less likely to be challenged than
+# Playwright's bundled Chromium, so install it and select it with a channel.
 RUN pip install ".[proxy]" \
     && python -m playwright install --with-deps chromium \
     && apt-get update \
-    && apt-get install -y --no-install-recommends xvfb xauth \
+    && apt-get install -y --no-install-recommends xvfb xauth wget ca-certificates \
+    && wget -qO /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+    && rm -f /tmp/chrome.deb \
     && rm -rf /var/lib/apt/lists/*
+
+ENV THEOLDLLM_CHANNEL=chrome
 
 ENV PORT=8080 \
     THEOLDLLM_STORAGE=/app/data/session.json

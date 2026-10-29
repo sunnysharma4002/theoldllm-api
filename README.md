@@ -186,6 +186,21 @@ curl https://<app>.up.railway.app/health?deep=1   # can it actually complete a c
 
 `deep` runs one real `gpt-6-luna` completion and returns `{"ok":true,"reply":"ok"}`
 or the exact upstream reason, e.g. `{"ok":false,"code":"turnstile_unavailable"}`.
+It also returns a `page` fingerprint (`userAgent`, `webdriver`, `brands`,
+`challengeFrames`) so a failure can be attributed:
+
+| `page.webdriver` | `page.brands` | Meaning | Lever |
+|---|---|---|---|
+| `true` | empty | the browser is being detected as automation | `THEOLDLLM_CHANNEL=chrome` (default in the image) |
+| `false` | populated | clean browser, still challenged | the **IP**: set `THEOLDLLM_PROXY` to a residential/mobile proxy |
+| `false` | populated | clean browser, no challenge frame | the page loaded wrong; check `page.title` |
+
+`THEOLDLLM_PROXY` accepts a URL (`http://host:port`) or JSON for authenticated
+proxies (`{"server": "http://host:port", "username": "...", "password": "..."}`).
+
+The image already installs Google Chrome and sets `THEOLDLLM_CHANNEL=chrome`,
+because Playwright's bundled Chromium is challenged far more often. If a channel
+fails to launch, the client logs a warning and falls back to bundled Chromium.
 
 This is best-effort: Cloudflare may serve an interactive challenge to a
 datacenter IP, and nothing can solve that unattended. Run it on a machine where

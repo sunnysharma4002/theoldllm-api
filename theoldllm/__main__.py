@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import sys
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from . import __version__
 from .client import TheOldLLM
@@ -50,6 +50,12 @@ def _parser() -> argparse.ArgumentParser:
         "--storage",
         default=os.environ.get("THEOLDLLM_STORAGE") or None,
         help="cookie/localStorage JSON to reuse (env: THEOLDLLM_STORAGE)",
+    )
+    serve.add_argument(
+        "--channel",
+        default=os.environ.get("THEOLDLLM_CHANNEL") or None,
+        choices=["chrome", "chromium", "msedge"],
+        help="use a real installed browser instead of bundled Chromium (env: THEOLDLLM_CHANNEL)",
     )
     serve.add_argument("--verbose", "-v", action="store_true")
     return parser
@@ -123,20 +129,33 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     return 0
 
 
+def _proxy_from_env() -> dict[str, Any] | None:
+    """Parse ``THEOLDLLM_PROXY``: a URL, or JSON for credentials."""
+    raw = os.environ.get("THEOLDLLM_PROXY")
+    if not raw:
+        return None
+    if raw.lstrip().startswith("{"):
+        return json.loads(raw)
+    return {"server": raw}
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     import asyncio
 
     from .proxy import serve
 
+    options: dict[str, Any] = {
+        "headless": args.headless,
+        "storage_path": args.storage,
+    }
+    if args.channel:
+        options["channel"] = args.channel
+    proxy = _proxy_from_env()
+    if proxy:
+        options["proxy"] = proxy
+
     try:
-        asyncio.run(
-            serve(
-                host=args.host,
-                port=args.port,
-                headless=args.headless,
-                storage_path=args.storage,
-            )
-        )
+        asyncio.run(serve(host=args.host, port=args.port, **options))
     except KeyboardInterrupt:
         pass
     return 0
