@@ -212,8 +212,18 @@ class AsyncTheOldLLM:
         self._context: Any = None
         self._page: Any = None
         self._started = False
-        self._lock = asyncio.Lock()
         self._closed = False
+        # Locks are created on first use so the object can be built outside a
+        # running loop (Python 3.9 binds a Lock to the loop it is made in).
+        self._request_lock: Optional[asyncio.Lock] = None
+        self._start_guard: Optional[asyncio.Lock] = None
+
+    def _lock(self, name: str) -> asyncio.Lock:
+        lock = getattr(self, name)
+        if lock is None:
+            lock = asyncio.Lock()
+            setattr(self, name, lock)
+        return lock
 
     # ------------------------------------------------------------------ setup
 
@@ -222,19 +232,20 @@ class AsyncTheOldLLM:
         return self._page
 
     async def start(self) -> "AsyncTheOldLLM":
-        if self._started:
+        async with self._lock("_start_guard"):
+            if self._started:
+                return self
+            if self._transport is None:
+                if self.headless:
+                    warnings.warn(
+                        "headless=True: Cloudflare Turnstile generally never fires in "
+                        "headless Chromium, so token minting will time out",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                await self._launch()
+            self._started = True
             return self
-        if self._transport is None:
-            if self.headless:
-                warnings.warn(
-                    "headless=True: Cloudflare Turnstile generally never fires in "
-                    "headless Chromium, so token minting will time out",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            await self._launch()
-        self._started = True
-        return self
 
     async def _launch(self) -> None:
         try:
@@ -394,7 +405,7 @@ class AsyncTheOldLLM:
 
         await self.start()
         last_error: Optional[Exception] = None
-        async with self._lock:
+        async with self._lock("_request_lock"):
             for attempt in range(1, attempts + 1):
                 try:
                     await self._settle()

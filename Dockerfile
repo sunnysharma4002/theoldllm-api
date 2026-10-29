@@ -11,10 +11,11 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY theoldllm ./theoldllm
 
+# xvfb-run needs xauth, which Playwright's own deps do not pull in.
 RUN pip install ".[proxy]" \
     && python -m playwright install --with-deps chromium \
     && apt-get update \
-    && apt-get install -y --no-install-recommends xvfb \
+    && apt-get install -y --no-install-recommends xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PORT=8080

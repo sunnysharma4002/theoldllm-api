@@ -185,7 +185,7 @@ await oldllm.raw(oldllm.buildPayload([{ role: "user", content: "hi" }]))
 
 ## Verification
 
-* Offline: `pytest` — 53 tests over SSE decoding, payload building, model
+* Offline: `pytest` — 54 tests over SSE decoding, payload building, model
   resolution, retry/error mapping, and the OpenAI facade. No network, no browser.
 * Live, in a page on the site: the exact JS shipped in
   `theoldllm/browser.py` (`_MINT_TOKEN_JS` + `_REQUEST_JS`) minted a token and

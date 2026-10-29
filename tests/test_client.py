@@ -186,3 +186,19 @@ def test_sync_client_bridges_the_background_loop():
         streamed = "".join(c.content for c in client.chat_stream("gpt-6-luna", [{"role": "user", "content": "hi"}]))
     assert streamed == "hello"
     assert len(transport.calls) == 2
+
+
+def test_concurrent_calls_are_serialised_on_one_page():
+    page = FakePage([OK_BODY, OK_BODY])
+    client = make_client(page)
+
+    async def go():
+        return await asyncio.gather(
+            client.chat("gpt-6-luna", [{"role": "user", "content": "a"}]),
+            client.chat("gpt-6-luna", [{"role": "user", "content": "b"}]),
+        )
+
+    assert run(go()) == ["hello", "hello"]
+    # Two calls, two tokens, and the page was never asked twice at once.
+    assert page.tokens_minted == 2
+    assert len(page.sent) == 2
