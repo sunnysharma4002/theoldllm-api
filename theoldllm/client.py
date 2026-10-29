@@ -1,415 +1,178 @@
+"""Blocking wrapper around :class:`theoldllm.browser.AsyncTheOldLLM`.
+
+Playwright's objects are bound to the event loop that created them, so the
+browser lives in a dedicated background thread with its own loop; calls are
+submitted to it and results are handed back through a queue. That keeps the
+familiar synchronous API without re-implementing the transport.
+"""
+
 from __future__ import annotations
 
-import json
-import time
-from typing import Any, Callable, Generator, Optional
+import asyncio
+import queue
+import sys
+import threading
+from typing import Any, Iterator, Mapping, Optional, Sequence
 
-import requests
+from .browser import (
+    BASE_URL,
+    CHAT_PATH,
+    LEGACY_CHAT_PATH,
+    AsyncTheOldLLM,
+)
+from .models import Model, Models
+from .payload import build_payload
+from .streaming import ChatCompletionChunk
 
-from .exceptions import APIError, AuthenticationError, RateLimitError, StreamError
-from .models import Model, Models, Provider
-from .streaming import ChatCompletionChunk, parse_sse_line
-
-BASE_URL = "https://theoldllm.vercel.app"
-API_ENDPOINTS = {
-    Provider.CHATGPT: "/api/chatgpt",
-    Provider.AICHAT: "/api/aichat",
+#: Endpoint per historical "provider" name; ``/api/aichat`` superseded both.
+API_ENDPOINTS: dict[str, str] = {
+    "aichat": CHAT_PATH,
+    "chatgpt": LEGACY_CHAT_PATH,
 }
-DEFAULT_TIMEOUT = 120
+
+_SENTINEL = object()
 
 
 class TheOldLLM:
-    def __init__(
-        self,
-        base_url: str = BASE_URL,
-        supabase_token: Optional[str] = None,
-        timeout: int = DEFAULT_TIMEOUT,
-        session: Optional[requests.Session] = None,
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.supabase_token = supabase_token
-        self.timeout = timeout
-        self.session = session or requests.Session()
+    """Synchronous client. Use as a context manager.
 
-        self._default_params = {
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "frequency_penalty": 0.0,
-            "presence_penalty": 0.0,
-        }
+    ```python
+    with TheOldLLM() as bot:                    # opens a headed Chromium
+        print(bot.chat("gpt-6-luna", [{"role": "user", "content": "hi"}]))
+    ```
 
-    def _get_headers(self) -> dict[str, str]:
-        headers = {
-            "Content-Type": "application/json",
-            "Origin": self.base_url,
-            "Referer": f"{self.base_url}/",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-        }
-        if self.supabase_token:
-            headers["X-Supabase-Auth"] = self.supabase_token
-        return headers
+    Accepts the same options as :class:`AsyncTheOldLLM` (``headless``,
+    ``storage_path``, ``proxy``, timeouts, ``transport``).
+    """
 
-    def _resolve_provider(self, model: str | Model) -> tuple[str, Provider]:
-        if isinstance(model, Model):
-            return model.id, model.provider
-        m = Models.by_id(model)
-        if m:
-            return m.id, m.provider
-        return model, Provider.CHATGPT
+    def __init__(self, **options: Any) -> None:
+        self._options = options
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._client: Optional[AsyncTheOldLLM] = None
+        self._start_lock = threading.Lock()
 
-    def _get_endpoint(self, provider: Provider) -> str:
-        endpoint = API_ENDPOINTS.get(provider, "/api/chatgpt")
-        return f"{self.base_url}{endpoint}"
+    # ------------------------------------------------------------------ setup
 
-    def _build_payload(
-        self,
-        model_id: str,
-        messages: list[dict],
-        provider: Provider,
-        stream: bool = True,
-        max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[str] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
-        web_search: bool = False,
-        upstream_provider: Optional[str] = None,
-        thread_id: Optional[str] = None,
-        **kwargs,
-    ) -> dict:
-        p = self._default_params.copy()
-        if temperature is not None:
-            p["temperature"] = temperature
-        if top_p is not None:
-            p["top_p"] = top_p
-        if frequency_penalty is not None:
-            p["frequency_penalty"] = frequency_penalty
-        if presence_penalty is not None:
-            p["presence_penalty"] = presence_penalty
-
-        payload: dict[str, Any] = {
-            "model": model_id,
-            "messages": messages,
-            "stream": stream,
-            **p,
-        }
-
-        m = Models.by_id(model_id)
-        default_max = m.max_tokens if m else 8192
-        payload["max_tokens"] = max_tokens or default_max
-
-        if reasoning_effort:
-            payload["reasoning_effort"] = reasoning_effort
-
-        if web_search:
-            payload["webSearch"] = True
-
-        if provider == Provider.AICHAT:
-            if upstream_provider:
-                payload["provider"] = upstream_provider
-            elif m and m.upstream_provider:
-                payload["provider"] = m.upstream_provider
-            if thread_id:
-                payload["threadId"] = thread_id
-
-        payload.update(kwargs)
-        return payload
-
-    def _handle_error(self, response: requests.Response) -> None:
-        status = response.status_code
-        body = response.text
-
-        try:
-            err_data = response.json()
-            err_msg = (
-                err_data.get("error", {}).get("message")
-                or err_data.get("error", "")
-                or err_data.get("message", "")
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        with self._start_lock:
+            if self._loop is not None:
+                return self._loop
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=self._run_loop,
+                args=(loop,),
+                name="theoldllm-loop",
+                daemon=True,
             )
-        except (json.JSONDecodeError, AttributeError):
-            err_msg = body[:500] if body else f"HTTP {status}"
+            thread.start()
+            self._loop = loop
+            self._thread = thread
+            return loop
 
-        if status == 401:
-            raise AuthenticationError(err_msg, status_code=status, body=body)
-        if status == 429 or status == 402:
-            raise RateLimitError(err_msg, status_code=status, body=body)
+    @staticmethod
+    def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
+        if sys.platform == "win32":  # Playwright needs a proactor loop to spawn the driver
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
 
-        raise APIError(err_msg, status_code=status, body=body)
+    def _submit(self, coro: Any) -> Any:
+        loop = self._ensure_loop()
+        return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
-    # --- Sync Streaming ---
+    def start(self) -> "TheOldLLM":
+        """Launch the browser now instead of on first use."""
+        if self._client is not None:
+            return self
+
+        async def boot() -> AsyncTheOldLLM:
+            client = AsyncTheOldLLM(**self._options)
+            return await client.start()
+
+        self._client = self._submit(boot())
+        return self
+
+    def close(self) -> None:
+        """Close the browser and stop the worker loop."""
+        if self._client is not None:
+            try:
+                self._submit(self._client.aclose())
+            finally:
+                self._client = None
+        with self._start_lock:
+            loop, thread = self._loop, self._thread
+            self._loop = self._thread = None
+        if loop is not None:
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            thread.join(timeout=10)
+
+    def __enter__(self) -> "TheOldLLM":
+        return self.start()
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------ calls
 
     def chat_stream(
         self,
         model: str | Model,
-        messages: list[dict],
-        max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[str] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
-        web_search: bool = False,
-        **kwargs,
-    ) -> Generator[ChatCompletionChunk, None, None]:
-        model_id, provider = self._resolve_provider(model)
-        endpoint = self._get_endpoint(provider)
+        messages: Sequence[Mapping[str, Any]],
+        **options: Any,
+    ) -> Iterator[ChatCompletionChunk]:
+        """Yield the reply delta by delta (see the note in ``AsyncTheOldLLM``)."""
+        if self._client is None:
+            self.start()
 
-        payload = self._build_payload(
-            model_id=model_id,
-            messages=messages,
-            provider=provider,
-            stream=True,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-            temperature=temperature,
-            top_p=top_p,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            web_search=web_search,
-            **kwargs,
-        )
+        pending: "queue.Queue[Any]" = queue.Queue()
 
-        resp = self.session.post(
-            endpoint,
-            headers=self._get_headers(),
-            json=payload,
-            stream=True,
-            timeout=self.timeout,
-        )
+        async def pump() -> None:
+            try:
+                async for chunk in self._client.chat_stream(model, messages, **options):
+                    pending.put(chunk)
+            except BaseException as exc:  # handed to the caller's thread
+                pending.put(exc)
+            finally:
+                pending.put(_SENTINEL)
 
-        if not resp.ok:
-            self._handle_error(resp)
-
-        buffer = ""
-        try:
-            for raw_chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
-                if raw_chunk is None:
-                    continue
-                buffer += raw_chunk
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    chunk = parse_sse_line(line)
-                    if chunk is not None:
-                        yield chunk
-                        if chunk.is_done:
-                            return
-        except requests.exceptions.ChunkedEncodingError as e:
-            raise StreamError(f"Stream interrupted: {e}") from e
-        except requests.exceptions.RequestException as e:
-            raise StreamError(f"Stream request failed: {e}") from e
-
-    # --- Sync Non-Streaming ---
+        future = asyncio.run_coroutine_threadsafe(pump(), self._loop)
+        while True:
+            item = pending.get()
+            if item is _SENTINEL:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+        future.result()
 
     def chat(
         self,
         model: str | Model,
-        messages: list[dict],
-        max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[str] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
-        web_search: bool = False,
-        **kwargs,
+        messages: Sequence[Mapping[str, Any]],
+        **options: Any,
     ) -> str:
-        content_parts: list[str] = []
-        for chunk in self.chat_stream(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-            temperature=temperature,
-            top_p=top_p,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            web_search=web_search,
-            **kwargs,
-        ):
-            if chunk.content:
-                content_parts.append(chunk.content)
-        return "".join(content_parts)
+        """Return the whole reply as one string."""
+        return "".join(chunk.content for chunk in self.chat_stream(model, messages, **options))
 
-    # --- Helper: format message ---
+    def request(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Send a prepared payload; returns ``{"status", "text"}``."""
+        if self._client is None:
+            self.start()
+        return self._submit(self._client.request(payload))
 
     @staticmethod
-    def user_message(content: str) -> dict:
-        return {"role": "user", "content": content}
+    def build_payload(model: str | Model, messages: Sequence[Mapping[str, Any]], **options: Any) -> dict[str, Any]:
+        return build_payload(model, messages, **options)
 
     @staticmethod
-    def assistant_message(content: str) -> dict:
-        return {"role": "assistant", "content": content}
+    def models(*, picker_only: bool = False) -> list[Model]:
+        return Models.picker() if picker_only else list(Models.ALL)
 
-    @staticmethod
-    def system_message(content: str) -> dict:
-        return {"role": "system", "content": content}
+    user_message = staticmethod(AsyncTheOldLLM.user_message)
+    assistant_message = staticmethod(AsyncTheOldLLM.assistant_message)
+    system_message = staticmethod(AsyncTheOldLLM.system_message)
 
 
-class AsyncTheOldLLM:
-    def __init__(
-        self,
-        base_url: str = BASE_URL,
-        supabase_token: Optional[str] = None,
-        timeout: int = DEFAULT_TIMEOUT,
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.supabase_token = supabase_token
-        self.timeout = timeout
-        self._default_params = {
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "frequency_penalty": 0.0,
-            "presence_penalty": 0.0,
-        }
-
-    def _get_headers(self) -> dict[str, str]:
-        headers = {
-            "Content-Type": "application/json",
-            "Origin": self.base_url,
-            "Referer": f"{self.base_url}/",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-        }
-        if self.supabase_token:
-            headers["X-Supabase-Auth"] = self.supabase_token
-        return headers
-
-    def _build_payload(self, **kwargs) -> dict:
-        p = self._default_params.copy()
-        overrides = {
-            "temperature": kwargs.pop("temperature", None),
-            "top_p": kwargs.pop("top_p", None),
-            "frequency_penalty": kwargs.pop("frequency_penalty", None),
-            "presence_penalty": kwargs.pop("presence_penalty", None),
-        }
-        for k, v in overrides.items():
-            if v is not None:
-                p[k] = v
-
-        payload: dict[str, Any] = {
-            "model": kwargs["model_id"],
-            "messages": kwargs["messages"],
-            "stream": kwargs.get("stream", True),
-            **p,
-        }
-
-        m = Models.by_id(kwargs["model_id"])
-        default_max = m.max_tokens if m else 8192
-        payload["max_tokens"] = kwargs.get("max_tokens") or default_max
-
-        if kwargs.get("reasoning_effort"):
-            payload["reasoning_effort"] = kwargs["reasoning_effort"]
-        if kwargs.get("web_search"):
-            payload["webSearch"] = True
-
-        provider = kwargs.get("provider")
-        if provider == Provider.AICHAT:
-            upstream = kwargs.get("upstream_provider") or (m and m.upstream_provider)
-            if upstream:
-                payload["provider"] = upstream
-
-        return payload
-
-    async def chat_stream(
-        self,
-        model: str | Model,
-        messages: list[dict],
-        max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[str] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
-        web_search: bool = False,
-        **kwargs,
-    ):
-        import httpx
-
-        model_id, provider = (
-            (model.id, model.provider) if isinstance(model, Model)
-            else (model, Provider.CHATGPT)
-        )
-        m = Models.by_id(model_id)
-        if m:
-            provider = m.provider
-
-        endpoint = API_ENDPOINTS.get(provider, "/api/chatgpt")
-        url = f"{self.base_url}{endpoint}"
-
-        payload = self._build_payload(
-            model_id=model_id,
-            messages=messages,
-            provider=provider,
-            stream=True,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-            temperature=temperature,
-            top_p=top_p,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            web_search=web_search,
-            upstream_provider=kwargs.pop("upstream_provider", None),
-        )
-
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            async with client.stream(
-                "POST",
-                url,
-                headers=self._get_headers(),
-                json=payload,
-            ) as resp:
-                if not resp.is_success:
-                    body = await resp.aread()
-                    err_text = body.decode() if body else ""
-                    if resp.status_code == 429:
-                        raise RateLimitError(err_text, status_code=resp.status_code)
-                    raise APIError(err_text, status_code=resp.status_code)
-
-                buffer = ""
-                async for raw_chunk in resp.aiter_text():
-                    buffer += raw_chunk
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        if not line:
-                            continue
-                        chunk = parse_sse_line(line)
-                        if chunk is not None:
-                            yield chunk
-                            if chunk.is_done:
-                                return
-
-    async def chat(
-        self,
-        model: str | Model,
-        messages: list[dict],
-        **kwargs,
-    ) -> str:
-        parts: list[str] = []
-        async for chunk in self.chat_stream(model=model, messages=messages, **kwargs):
-            if chunk.content:
-                parts.append(chunk.content)
-        return "".join(parts)
-
-    @staticmethod
-    def user_message(content: str) -> dict:
-        return {"role": "user", "content": content}
-
-    @staticmethod
-    def assistant_message(content: str) -> dict:
-        return {"role": "assistant", "content": content}
-
-    @staticmethod
-    def system_message(content: str) -> dict:
-        return {"role": "system", "content": content}
+__all__ = ["API_ENDPOINTS", "AsyncTheOldLLM", "BASE_URL", "CHAT_PATH", "TheOldLLM"]

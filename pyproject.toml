@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "theoldllm"
+version = "0.2.0"
+description = "Unofficial Python client for TheOldLLM — browser-backed, Turnstile-aware"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "TheOldLLM community" }]
+keywords = ["theoldllm", "llm", "playwright", "openai-compatible"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["playwright>=1.40"]
+
+[project.optional-dependencies]
+proxy = ["aiohttp>=3.9"]
+dev = ["pytest>=8", "aiohttp>=3.9"]
+
+[project.scripts]
+theoldllm = "theoldllm.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["theoldllm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

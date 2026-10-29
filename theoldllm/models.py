@@ -1,145 +1,194 @@
+"""Model catalogue.
+
+The ids below are the ones the site's own bundle ships (``assets/index-*.js``);
+the upstream ``provider`` string is echoed back in the request body and the
+``upstream_model`` column is what the server forwards to the LLM vendor.
+
+Nothing here is guessed. ``gpt-6-luna``, ``gpt-5.5-thinking`` and
+``gemini-3.8-flash`` were verified to answer anonymously; the ids marked
+``requires_account`` returned ``403 ACCESS_DENIED`` for the same anonymous
+request, which is the flag the bundle calls ``requiresVerifiedAccount``.
+"""
+
+from __future__ import annotations
+
+import warnings
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Iterable, Optional
+
+from .exceptions import UnknownModelError
+
+#: Matches the site's own default output budget.
+DEFAULT_MAX_TOKENS = 16000
 
 
-class Provider(Enum):
-    CHATGPT = "chatgpt"
-    AICHAT = "aichat"
-    ENHANCED = "p1"
-    STANDARD = "p2"
-    CLOUD = "p3"
-    PREMIUM = "p4"
-    UNIVERSAL = "p7"
-    OLDLLM = "p9"
-    BLAZEAI = "p13"
+class Provider(str, Enum):
+    """Value sent as the ``provider`` field of the request."""
+
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+    GOOGLE = "google"
+    XAI = "xai"
+
+    def __str__(self) -> str:  # pragma: no cover - cosmetic
+        return self.value
 
 
-@dataclass
+@dataclass(frozen=True)
 class Model:
     id: str
     name: str
     provider: Provider
-    supports_streaming: bool = True
-    supports_reasoning: bool = False
-    supports_images: bool = False
-    supports_search: bool = False
-    max_tokens: int = 8192
+    upstream_model: str = ""
+    requires_account: bool = False
+    unavailable: bool = False
+    hidden: bool = False
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    supports_reasoning: bool = True
     description: str = ""
-    upstream_model: Optional[str] = None
-    upstream_provider: Optional[str] = None
+
+    @property
+    def upstream_provider(self) -> str:
+        """Backwards-compatible alias for :attr:`provider`."""
+        return self.provider.value
+
+    @property
+    def anonymous(self) -> bool:
+        """True when the model answers without a signed-in account."""
+        return not self.requires_account and not self.unavailable
 
 
-class Models:
-    ALL: list[Model] = []
+MODELS: tuple[Model, ...] = (
+    Model("gpt-6-sol", "GPT-6 Sol", Provider.OPENAI, "gpt-6-sol", requires_account=True),
+    Model("gpt-6-luna", "GPT-6 Luna", Provider.OPENAI, "gpt-6-luna"),
+    Model(
+        "gpt-6-astra",
+        "GPT-6 Astra",
+        Provider.OPENAI,
+        "gpt-6-astra",
+        requires_account=True,
+        unavailable=True,
+        description="Force-disabled in the bundle; listing it is informational.",
+    ),
+    Model("gpt-5.6-sol", "GPT-5.6 Sol", Provider.OPENAI, "gpt-5.6-sol", requires_account=True),
+    Model("gpt-5.6-terra", "GPT-5.6 Terra", Provider.OPENAI, "gpt-5.6-terra", requires_account=True),
+    Model("gpt-5.6-luna", "GPT-5.6 Luna", Provider.OPENAI, "gpt-5.6-luna", requires_account=True),
+    Model("gpt-5.5-thinking", "GPT-5.5 Thinking", Provider.OPENAI, "gpt-5.5"),
+    Model(
+        "gpt-5-mini-aichat",
+        "GPT-5 Mini",
+        Provider.OPENAI,
+        "gpt-5-mini",
+        hidden=True,
+        description="Kept as a fallback in the bundle; not shown in the model picker.",
+    ),
+    Model(
+        "claude-opus-4-7",
+        "Claude Opus 5.5",
+        Provider.ANTHROPIC,
+        "claude-opus-4-7",
+        requires_account=True,
+    ),
+    Model(
+        "gemini-3.1-pro",
+        "Gemini 3.1 Pro",
+        Provider.GOOGLE,
+        "gemini-3.1-pro-preview",
+        requires_account=True,
+    ),
+    Model("gemini-3.8-flash", "Gemini 3.8 Flash", Provider.GOOGLE, "gemini-3.8-flash"),
+    Model("grok-4.7-latest", "Grok 4.7", Provider.XAI, "grok-4.7", requires_account=True),
+    Model("grok-4.5-latest", "Grok 4.5", Provider.XAI, "grok-4.5-latest"),
+    Model("grok-4.3-latest", "Grok 4.3", Provider.XAI, "grok-4.3-latest"),
+)
 
-    @classmethod
-    def by_id(cls, model_id: str) -> Optional[Model]:
-        for m in cls.ALL:
+#: Ids that existed in earlier versions of this client and no longer exist on
+#: the site. They are resolved to the closest model that does, with a
+#: ``DeprecationWarning``, so old scripts keep running instead of dying.
+ALIASES: dict[str, str] = {
+    "gpt-5.6-sol-preview": "gpt-5.6-sol",
+    "gpt-5.5": "gpt-5.5-thinking",
+    "gpt-5.5-sol": "gpt-5.5-thinking",
+    "gpt-5.4": "gpt-5.5-thinking",
+    "gpt-5.3": "gpt-5.5-thinking",
+    "gpt-5.2": "gpt-5.5-thinking",
+    "gpt-5.1": "gpt-5.5-thinking",
+    "gpt-5-mini": "gpt-5-mini-aichat",
+    "claude-sonnet-5": "claude-opus-4-7",
+    "claude-opus-4-8": "claude-opus-4-7",
+    "claude-opus-4.5": "claude-opus-4-7",
+    "claude-fable-5": "claude-opus-4-7",
+    "gemini-3.5-flash": "gemini-3.8-flash",
+    "grok-4.2-latest": "grok-4.3-latest",
+    "grok-4.1-latest": "grok-4.3-latest",
+    "grok-4": "grok-4.3-latest",
+}
+
+
+@dataclass
+class _Registry:
+    """Thin, importable registry; ``Models.ALL`` is a plain list."""
+
+    ALL: list[Model] = field(default_factory=lambda: list(MODELS))
+
+    def by_id(self, model_id: str, *, strict: bool = True) -> Optional[Model]:
+        """Return the model for ``model_id``, following deprecation aliases.
+
+        Args:
+            model_id: catalogue id or a historical alias.
+            strict: raise :class:`UnknownModelError` instead of returning None.
+        """
+        for m in self.ALL:
             if m.id == model_id:
                 return m
+        alias = ALIASES.get(model_id)
+        if alias is not None:
+            warnings.warn(
+                f"model {model_id!r} no longer exists on TheOldLLM; "
+                f"using {alias!r} instead",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            return self.by_id(alias, strict=strict)
+        if strict:
+            raise UnknownModelError(model_id, self.list_ids())
         return None
 
-    @classmethod
-    def by_provider(cls, provider: Provider) -> list[Model]:
-        return [m for m in cls.ALL if m.provider == provider]
+    def by_provider(self, provider: Provider | str) -> list[Model]:
+        want = Provider(provider) if isinstance(provider, str) else provider
+        return [m for m in self.ALL if m.provider is want]
 
-    @classmethod
-    def list_ids(cls) -> list[str]:
-        return [m.id for m in cls.ALL]
+    def list_ids(self, *, include_hidden: bool = True, include_unavailable: bool = True) -> list[str]:
+        return [
+            m.id
+            for m in self.ALL
+            if (include_hidden or not m.hidden)
+            and (include_unavailable or not m.unavailable)
+        ]
+
+    def anonymous(self) -> list[Model]:
+        return [m for m in self.ALL if m.anonymous and not m.hidden]
+
+    def picker(self) -> list[Model]:
+        """What the site's own model dropdown shows."""
+        return [m for m in self.ALL if not m.hidden and not m.unavailable]
+
+    def __iter__(self) -> Iterable[Model]:  # pragma: no cover - convenience
+        return iter(self.ALL)
 
 
-Models.ALL = [
-    # --- AIChat Bridge ---
-    Model("claude-sonnet-5", "Claude Sonnet 5", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="claude-sonnet-5", upstream_provider="anthropic"),
-    Model("claude-opus-4-8", "Claude Opus 4.8", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="claude-opus-4-8", upstream_provider="anthropic"),
-    Model("claude-opus-4-7", "Claude Opus 4.7", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="claude-opus-4-7", upstream_provider="anthropic"),
-    Model("claude-fable-5", "Claude Fable 5", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="claude-fable-5", upstream_provider="anthropic"),
-    Model("gpt-5.6-sol", "GPT-5.6 Sol", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="gpt-5.6-sol", upstream_provider="openai"),
-    Model("gpt-5.6-terra", "GPT-5.6 Terra", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="gpt-5.6-terra", upstream_provider="openai"),
-    Model("gpt-5.6-luna", "GPT-5.6 Luna", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="gpt-5.6-luna", upstream_provider="openai"),
-    Model("gpt-5.5-thinking", "GPT-5.5 Thinking", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="gpt-5.5-thinking", upstream_provider="openai"),
-    Model("gpt-5-mini-aichat", "GPT-5 Mini", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="gpt-5-mini-aichat", upstream_provider="openai"),
-    Model("gemini-3.1-pro", "Gemini 3.1 Pro", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="gemini-3.1-pro", upstream_provider="google"),
-    Model("gemini-3.5-flash", "Gemini 3.5 Flash", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="gemini-3.5-flash", upstream_provider="google"),
-    Model("grok-4.5-latest", "Grok 4.5", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="grok-4.5-latest", upstream_provider="xai"),
-    Model("grok-4.3-latest", "Grok 4.3", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="grok-4.3-latest", upstream_provider="xai"),
-    Model("grok-4.2-latest", "Grok 4.2", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="grok-4.2-latest", upstream_provider="xai"),
-    Model("grok-4.1-latest", "Grok 4.1", Provider.AICHAT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536,
-          upstream_model="grok-4.1-latest", upstream_provider="xai"),
+Models = _Registry()
 
-    # --- ChatGPT/OpenRouter provider ---
-    Model("gpt-5.4", "GPT-5.4", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("gpt-5.3", "GPT-5.3", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("gpt-5.2", "GPT-5.2", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("gpt-5.1", "GPT-5.1", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("o4-mini", "o4-mini", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("o3", "o3", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("o3-mini", "o3-mini", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("gpt-4o", "GPT-4o", Provider.CHATGPT,
-          supports_streaming=True, max_tokens=16384),
-    Model("gpt-4o-mini", "GPT-4o Mini", Provider.CHATGPT,
-          supports_streaming=True, max_tokens=16384),
-    Model("gemini-2.5-pro", "Gemini 2.5 Pro", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("gemini-2.5-flash", "Gemini 2.5 Flash", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("gemini-2.0-flash-001", "Gemini 2.0 Flash", Provider.CHATGPT,
-          supports_streaming=True, max_tokens=16384),
-    Model("claude-sonnet-4.5", "Claude Sonnet 4.5", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("claude-haiku-4.5", "Claude Haiku 4.5", Provider.CHATGPT,
-          supports_streaming=True, max_tokens=16384),
-    Model("claude-opus-4.5", "Claude Opus 4.5", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("llama-4-maverick", "Llama 4 Maverick", Provider.CHATGPT,
-          supports_streaming=True, max_tokens=16384),
-    Model("deepseek-v3", "DeepSeek V3", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("deepseek-r1", "DeepSeek R1", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("grok-4", "Grok 4", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("grok-3", "Grok 3", Provider.CHATGPT,
-          supports_streaming=True, supports_reasoning=True, max_tokens=65536),
-    Model("sonar-pro", "Sonar Pro", Provider.CHATGPT,
-          supports_streaming=True, supports_search=True, max_tokens=16384),
-    Model("sonar-deep-research", "Sonar Deep Research", Provider.CHATGPT,
-          supports_streaming=True, supports_search=True, max_tokens=16384),
+#: Models that need a signed-in account; anonymous calls get ``ACCESS_DENIED``.
+VERIFIED_ONLY: frozenset[str] = frozenset(m.id for m in MODELS if m.requires_account)
+
+__all__ = [
+    "ALIASES",
+    "DEFAULT_MAX_TOKENS",
+    "Model",
+    "Models",
+    "MODELS",
+    "Provider",
+    "VERIFIED_ONLY",
 ]
