@@ -267,6 +267,12 @@ class AsyncTheOldLLM:
                 "--disable-dev-shm-usage",
                 # Keeps navigator.webdriver falsy. Not sufficient on its own.
                 "--disable-blink-features=AutomationControlled",
+                # Xvfb has no window manager, so Chrome can decide its window is
+                # occluded/backgrounded and throttle timers - which stalls the
+                # Turnstile widget before it ever answers.
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
             ],
             # Playwright adds --enable-automation by default; it is one of the
             # cheapest bot signals to read, so drop it.
@@ -385,6 +391,10 @@ class AsyncTheOldLLM:
                 f"Vercel's security checkpoint (state: {state})"
             ) from exc
         # Give the patched fetch / human-check runtime a moment to install.
+        try:
+            await page.bring_to_front()
+        except Exception:  # pragma: no cover - browser-specific
+            pass
         await asyncio.sleep(self.settle_delay)
 
     async def _mint_token(self) -> str:

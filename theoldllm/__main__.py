@@ -57,6 +57,12 @@ def _parser() -> argparse.ArgumentParser:
         choices=["chrome", "chromium", "msedge"],
         help="use a real installed browser instead of bundled Chromium (env: THEOLDLLM_CHANNEL)",
     )
+    serve.add_argument(
+        "--token-timeout",
+        type=float,
+        default=float(os.environ.get("THEOLDLLM_TOKEN_TIMEOUT", "45")),
+        help="seconds to wait for a Turnstile token (env: THEOLDLLM_TOKEN_TIMEOUT)",
+    )
     serve.add_argument("--verbose", "-v", action="store_true")
     return parser
 
@@ -147,6 +153,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     options: dict[str, Any] = {
         "headless": args.headless,
         "storage_path": args.storage,
+        "token_timeout": args.token_timeout,
     }
     if args.channel:
         options["channel"] = args.channel
