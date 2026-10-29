@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from typing import Optional, Sequence
 
@@ -45,7 +46,11 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=11434)
     serve.add_argument("--headless", action="store_true")
-    serve.add_argument("--storage", default=None)
+    serve.add_argument(
+        "--storage",
+        default=os.environ.get("THEOLDLLM_STORAGE") or None,
+        help="cookie/localStorage JSON to reuse (env: THEOLDLLM_STORAGE)",
+    )
     serve.add_argument("--verbose", "-v", action="store_true")
     return parser
 

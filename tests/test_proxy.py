@@ -127,3 +127,27 @@ def test_health_reports_browser_state():
     body = with_proxy(Transport(), scenario)
     assert body["status"] == "starting"  # transport-only client has no page
     assert body["upstream"].startswith("https://theoldllm")
+
+
+def test_deep_health_runs_a_real_completion():
+    async def scenario(http, _client):
+        async with http.get("/health?deep=1") as response:
+            return response.status, await response.json()
+
+    status, body = with_proxy(Transport(), scenario)
+    assert status == 200
+    assert body["deep"] == {"ok": True, "model": "gpt-6-luna", "reply": "hello"}
+
+
+def test_deep_health_reports_a_turnstile_failure_as_data_not_a_crash():
+    from theoldllm.exceptions import TurnstileError
+
+    async def scenario(http, _client):
+        async with http.get("/health?deep=1") as response:
+            return response.status, await response.json()
+
+    status, body = with_proxy(Transport(error=TurnstileError("no token, headless?")), scenario)
+    assert status == 200
+    assert body["status"] == "error"
+    assert body["deep"]["code"] == "turnstile_unavailable"
+    assert "headless" in body["deep"]["error"]

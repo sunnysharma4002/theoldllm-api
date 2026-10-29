@@ -18,8 +18,12 @@ RUN pip install ".[proxy]" \
     && apt-get install -y --no-install-recommends xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PORT=8080
+ENV PORT=8080 \
+    THEOLDLLM_STORAGE=/app/data/session.json
 EXPOSE 8080
+
+# Railway mounts a volume here if you add one; otherwise it is just a cache.
+RUN mkdir -p /app/data
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s \
     CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8080')+'/health').read()"

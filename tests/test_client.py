@@ -23,12 +23,16 @@ class FakePage:
         self.tokens_minted = 0
         self.sent = []
         self.settles = 0
+        self.reloads = 0
 
     async def wait_for_load_state(self, *args, **kwargs):
         self.settles += 1
 
     async def wait_for_function(self, *args, **kwargs):
         return True
+
+    async def reload(self, *args, **kwargs):
+        self.reloads += 1
 
     async def evaluate(self, script, arg=None):
         if "turnstile.render" in script:
@@ -90,6 +94,15 @@ def test_bot_check_failure_is_retried_with_a_fresh_token():
     assert run(client.chat("gpt-6-luna", [{"role": "user", "content": "hi"}])) == "hello"
     assert page.tokens_minted == 2
     assert [call["token"] for call in page.sent] == ["token-1", "token-2"]
+
+
+def test_repeated_bot_check_failures_reload_the_page():
+    page = FakePage([BOT_FAILED_BODY, BOT_FAILED_BODY, OK_BODY])
+    client = make_client(page)
+
+    assert run(client.chat("gpt-6-luna", [{"role": "user", "content": "hi"}])) == "hello"
+    assert page.reloads == 1  # the second rejection rebuilds the human-check runtime
+    assert page.tokens_minted == 3
 
 
 def test_navigation_during_the_call_is_retried():
