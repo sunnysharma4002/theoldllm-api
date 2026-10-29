@@ -84,13 +84,21 @@ class OpenAICompatProxy:
         self._client_options = client_options or {}
         self._runner: Any = None
         self._site: Any = None
+        self._client_lock: Optional[asyncio.Lock] = None
 
     # ----------------------------------------------------------------- client
 
     async def client(self) -> AsyncTheOldLLM:
         if self._client is None:
-            self._client = AsyncTheOldLLM(**self._client_options)
-            await self._client.start()
+            if self._client_lock is None:
+                self._client_lock = asyncio.Lock()
+            async with self._client_lock:
+                # Re-check under the lock: a burst of requests must not each
+                # launch their own browser.
+                if self._client is None:
+                    client = AsyncTheOldLLM(**self._client_options)
+                    await client.start()
+                    self._client = client
         return self._client
 
     # --------------------------------------------------------------- handlers
